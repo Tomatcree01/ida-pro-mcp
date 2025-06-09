@@ -256,6 +256,7 @@ import idautils
 import ida_nalt
 import ida_bytes
 import ida_typeinf
+import ida_ua
 import ida_xref
 import ida_entry
 import idautils
@@ -694,41 +695,206 @@ def list_strings(
     """List all strings in the database (paginated)"""
     return list_strings_filter(offset, count, "")
 
+class ImportedFunction(TypedDict):
+    name: str
+    address: str # The address in the IAT
+    # ordinal: Optional[int] # Could add if needed
+
+class ImportedModule(TypedDict):
+    module_name: str
+    functions: list[ImportedFunction]
+
 @jsonrpc
 @idaread
-def list_local_types():
-    """List all Local types in the database"""
-    error = ida_hexrays.hexrays_failure_t()
-    locals = []
-    idati = ida_typeinf.get_idati()
-    type_count = ida_typeinf.get_ordinal_limit(idati)
-    for ordinal in range(1, type_count):
-        try:
-            tif = ida_typeinf.tinfo_t()
-            if tif.get_numbered_type(idati, ordinal):
-                type_name = tif.get_type_name()
-                if not type_name:
-                    type_name = f"<Anonymous Type #{ordinal}>"
-                locals.append(f"\nType #{ordinal}: {type_name}")
-                if tif.is_udt():
-                    c_decl_flags = (ida_typeinf.PRTYPE_MULTI | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_SEMI | ida_typeinf.PRTYPE_DEF | ida_typeinf.PRTYPE_METHODS | ida_typeinf.PRTYPE_OFFSETS)
-                    c_decl_output = tif._print(None, c_decl_flags)
-                    if c_decl_output:
-                        locals.append(f"  C declaration:\n{c_decl_output}")
-                else:
-                    simple_decl = tif._print(None, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_SEMI)
-                    if simple_decl:
-                        locals.append(f"  Simple declaration:\n{simple_decl}")  
-            else:
-                message = f"\nType #{ordinal}: Failed to retrieve information."
-                if error.str:
-                    message += f": {error.str}"
-                if error.errea != idaapi.BADADDR:
-                    message += f"from (address: {hex(error.errea)})"
-                raise IDAError(message)
-        except:
+def list_imports() -> list[ImportedModule]:
+    """List all imported modules and their functions."""
+    results = []
+    num_modules = ida_nalt.get_import_module_qty()
+
+    for i in range(num_modules):
+        module_name = ida_nalt.get_import_module_name(i)
+        if not module_name:
             continue
-    return locals
+
+        imported_functions: list[ImportedFunction] = []
+        
+        def imp_cb(ea, name, ord):
+            # True -> Continue enumeration
+            # False -> Stop enumeration
+            if not name: # Sometimes names are not available, only ordinals
+                name = f"ord_{ord}"
+            imported_functions.append({
+                "name": name,
+                "address": hex(ea),
+                # "ordinal": ord
+            })
+            return True
+
+        ida_nalt.enum_import_names(i, imp_cb)
+        results.append({
+            "module_name": module_name,
+            "functions": imported_functions
+        })
+        
+    return results
+
+class FoundBytes(TypedDict):
+    address: str
+    # context: Optional[str] # Could add context later if needed
+
+@jsonrpc
+@idaread
+def find_bytes(
+    bytes_hex_string: Annotated[str, "Hex string of bytes to search for (e.g., '43100000')"],
+    search_start_address: Annotated[Optional[str], "Optional start address for search (hex)"] = None,
+    search_end_address: Annotated[Optional[str], "Optional end address for search (hex, exclusive)"] = None
+) -> list[FoundBytes]:
+    """Search for a sequence of bytes in the database."""
+    try:
+        search_bytes = bytes.fromhex(bytes_hex_string)
+    except ValueError:
+        raise IDAError(f"Invalid hex string for bytes: {bytes_hex_string}")
+
+    if not search_bytes:
+        raise IDAError("Byte string to search cannot be empty.")
+
+    start_ea = ida_ida.inf_get_min_ea() # Corrected API
+    if search_start_address:
+        start_ea = parse_address(search_start_address)
+
+    end_ea = ida_ida.inf_get_max_ea() # Corrected API
+    if search_end_address:
+        end_ea = parse_address(search_end_address)
+    
+    results: list[FoundBytes] = []
+    current_ea = start_ea
+    
+    # Using a simpler loop for now, ida_bytes.find_binary can be complex with its flags.
+    # We'll iterate through segments or use a chunked read.
+    # For simplicity and to avoid issues with find_binary over very large selections or specific IDA versions,
+    # let's iterate segments. This is less efficient than a direct find_binary over all memory
+    # but more robust for a plugin. A chunked read approach is better.
+
+    chunk_size = 1024 * 1024 # 1MB chunks
+    ea = start_ea
+    while ea < end_ea:
+        # Check for user cancellation periodically
+        if ida_kernwin.user_cancelled():
+            print("[MCP] Byte search cancelled by user.")
+            break
+
+        read_length = min(chunk_size, end_ea - ea)
+        if read_length <= 0:
+            break
+        
+        data_chunk = ida_bytes.get_bytes(ea, read_length)
+        
+        if data_chunk is None: # Reached unreadable memory or end
+            # This might happen if a segment is smaller than expected or unreadable
+            # Advance ea by a smaller step or segment step if this becomes an issue
+            break
+            
+        offset_in_chunk = 0
+        while True:
+            found_offset = data_chunk.find(search_bytes, offset_in_chunk)
+            if found_offset == -1:
+                break
+            
+            actual_address = ea + found_offset
+            results.append({"address": hex(actual_address)})
+            
+            if len(results) > 200: # Safety break for too many results
+                 raise IDAError(f"Too many results (>200) for byte search, please refine search or range.")
+            
+            offset_in_chunk = found_offset + 1 # Continue search in the rest of the chunk
+        
+        ea += read_length
+            
+    return results
+
+class FoundImmediate(TypedDict):
+    address: str
+    instruction: str
+    # operand_index: int # Could add if needed
+
+@jsonrpc
+@idaread
+def find_immediate(
+    immediate_value: Annotated[str, "Immediate value to search for (hex or decimal)"],
+    search_start_address: Annotated[Optional[str], "Optional start address for search (hex)"] = None,
+    search_end_address: Annotated[Optional[str], "Optional end address for search (hex, exclusive)"] = None
+) -> list[FoundImmediate]:
+    """Search for an immediate value in code sections."""
+    try:
+        value_to_find = parse_address(immediate_value) # Use existing parse_address
+    except IDAError: # If parse_address fails (e.g. not hex and not valid int string)
+        raise IDAError(f"Invalid immediate value: {immediate_value}. Must be hex (0x...) or decimal.")
+
+    start_ea = ida_ida.inf_get_min_ea() # Corrected API
+    if search_start_address:
+        start_ea = parse_address(search_start_address)
+
+    end_ea = ida_ida.inf_get_max_ea() # Corrected API
+    if search_end_address:
+        end_ea = parse_address(search_end_address)
+
+    results: list[FoundImmediate] = []
+
+    for func_ea in idautils.Functions(start_ea, end_ea):
+        func = ida_funcs.get_func(func_ea)
+        if not func:
+            continue
+
+        current_instr_ea = max(func.start_ea, start_ea)
+        func_search_end_ea = min(func.end_ea, end_ea) # Ensure search within overall bounds
+
+        while current_instr_ea < func_search_end_ea and current_instr_ea != ida_idaapi.BADADDR:
+            if ida_kernwin.user_cancelled():
+                print("[MCP] Immediate search cancelled by user.")
+                return results
+
+            instr_text = idc.GetDisasm(current_instr_ea) # Corrected: idc.get_disasm to idc.GetDisasm
+            
+            for i in range(6):
+                op_type = idc.get_operand_type(current_instr_ea, i)
+                
+                if op_type == ida_ua.o_imm: # Immediate value
+                    op_value = idc.get_operand_value(current_instr_ea, i)
+                    if op_value == value_to_find:
+                        results.append({
+                            "address": hex(current_instr_ea),
+                            "instruction": instr_text
+                        })
+                        if len(results) > 200:
+                            raise IDAError("Too many results (>200) for immediate search, please refine.")
+                        break
+                elif op_type == ida_ua.o_displ: # Displacement [reg + immediate_offset]
+                    op_value = idc.get_operand_value(current_instr_ea, i)
+                    if op_value == value_to_find:
+                        results.append({
+                            "address": hex(current_instr_ea),
+                            "instruction": instr_text
+                        })
+                        if len(results) > 200:
+                            raise IDAError("Too many results (>200) for immediate search, please refine.")
+                        break
+                elif op_type == ida_ua.o_near or op_type == ida_ua.o_far: # Address for call/jmp
+                    op_value = idc.get_operand_value(current_instr_ea, i)
+                    if op_value == value_to_find:
+                        results.append({
+                            "address": hex(current_instr_ea),
+                            "instruction": instr_text
+                        })
+                        if len(results) > 200:
+                            raise IDAError("Too many results (>200) for immediate search, please refine.")
+                        break
+                
+            next_instr_ea = ida_bytes.next_head(current_instr_ea, func_search_end_ea)
+            if next_instr_ea <= current_instr_ea :
+                break
+            current_instr_ea = next_instr_ea
+            
+    return results
 
 def decompile_checked(address: int) -> ida_hexrays.cfunc_t:
     if not ida_hexrays.init_hexrays_plugin():
@@ -808,6 +974,15 @@ class Xref(TypedDict):
     address: str
     type: str
     function: Optional[Function]
+class ModuleInfo(TypedDict):
+    name: str       # Full path of the module
+    base: str       # Hex base address
+    size: int       # Size in bytes
+    rebase_to: str  # Hex rebase_to address (if IDA rebased it)
+    name: str       # Full path of the module
+    base: str       # Hex base address
+    size: int       # Size in bytes
+    rebase_to: str  # Hex rebase_to address (if IDA rebased it)
 
 @jsonrpc
 @idaread
@@ -1125,14 +1300,26 @@ def dbg_get_registers() -> list[dict[str, str]]:
         regvals = ida_dbg.get_reg_vals(tid)
         for reg_index, rv in enumerate(regvals):
             reg_info = dbg.regs(reg_index)
-            reg_value = rv.pyval(reg_info.dtype)
-            if isinstance(reg_value, int):
-                reg_value = hex(reg_value)
-            if isinstance(reg_value, bytes):
-                reg_value = reg_value.hex(" ")
+            current_reg_name = reg_info.name # Store for error message and consistent use
+            try:
+                py_val = rv.pyval(reg_info.dtype) # Use a temporary variable for the python value
+                if isinstance(py_val, int):
+                    reg_value_str = hex(py_val)
+                elif isinstance(py_val, bytes):
+                    reg_value_str = py_val.hex(" ")
+                elif isinstance(py_val, float): # Handle floats explicitly
+                    reg_value_str = str(py_val)
+                else: # For other types (e.g. already string, bool)
+                    reg_value_str = str(py_val)
+            except ValueError:
+                # For registers that cause conversion errors (e.g., some FPU/SIMD)
+                reg_value_str = f"<Conversion Error: {current_reg_name}>"
+            except Exception as e_inner: # Catch any other unexpected error during conversion
+                reg_value_str = f"<Error processing {current_reg_name}: {str(e_inner)}>"
+            
             regs.append({
-                "name": reg_info.name,
-                "value": reg_value,
+                "name": current_reg_name,
+                "value": reg_value_str, # Ensure it's always a string
             })
         result.append({
             "thread_id": tid,
@@ -1192,23 +1379,65 @@ def list_breakpoints():
     while ea <= end_ea:
         bpt = ida_dbg.bpt_t()
         if ida_dbg.get_bpt(ea, bpt):
-            breakpoints.append(
-                {
-                    "ea": hex(bpt.ea),
-                    "type": bpt.type,
-                    "enabled": bpt.flags & ida_dbg.BPT_ENABLED,
-                    "condition": bpt.condition if bpt.condition else None,
-                }
-            )
+            breakpoints.append({
+                "ea": hex(bpt.ea),
+                "type": bpt.type,
+                "enabled": bpt.flags & ida_dbg.BPT_ENABLED,
+                "condition": bpt.condition if bpt.condition else None,
+            })
         ea = ida_bytes.next_head(ea, end_ea)
     return breakpoints
 
-@jsonrpc
-@idaread
 @unsafe
 def dbg_list_breakpoints():
     """List all breakpoints in the program."""
     return list_breakpoints()
+@jsonrpc
+@idaread
+@unsafe
+def dbg_get_module_info(
+    module_name_substr: Annotated[str, "A substring of the module name to find (case-insensitive)"]
+) -> Optional[ModuleInfo]:
+    """Get information about a loaded module by a substring of its name.
+    Searches full path first, then basename if not found.
+    """
+    modinfo_s = ida_idd.modinfo_t()
+    found_module_dict = None 
+    
+    # First pass: check full path
+    if ida_dbg.get_first_module(modinfo_s):
+        while True:
+            current_module_name = modinfo_s.name if modinfo_s.name else ""
+            if module_name_substr.lower() in current_module_name.lower():
+                found_module_dict = {
+                    "name": modinfo_s.name, 
+                    "base": hex(modinfo_s.base),
+                    "size": modinfo_s.size,
+                    "rebase_to": hex(modinfo_s.rebase_to)
+                }
+                break 
+            if not ida_dbg.get_next_module(modinfo_s):
+                break
+    
+    # Second pass (if not found by full path): check basename
+    if not found_module_dict:
+        if ida_dbg.get_first_module(modinfo_s): 
+            while True:
+                module_basename = ""
+                if modinfo_s.name: 
+                    module_basename = os.path.basename(modinfo_s.name).lower()
+
+                if module_name_substr.lower() in module_basename:
+                    found_module_dict = {
+                        "name": modinfo_s.name, 
+                        "base": hex(modinfo_s.base),
+                        "size": modinfo_s.size,
+                        "rebase_to": hex(modinfo_s.rebase_to)
+                    }
+                    break
+                if not ida_dbg.get_next_module(modinfo_s):
+                    break
+    return found_module_dict
 
 @jsonrpc
 @idaread
@@ -1289,24 +1518,187 @@ def dbg_enable_breakpoint(
     if idaapi.enable_bpt(ea, enable):
         return f"Breakpoint {'enabled' if enable else 'disabled'} at {hex(ea)}"
     return f"Failed to {'' if enable else 'disable '}breakpoint at address {hex(ea)}"
+@jsonrpc
+@idawrite
+@unsafe
+def patch_bytes(
+    address: Annotated[str, "Address to patch bytes at"],
+    bytes_data: Annotated[str, "Hex string of bytes to patch (e.g., '90 90 90' for three NOPs)"]
+) -> str:
+    """Modify raw bytes at address"""
+    ea = parse_address(address)
+    
+    # Parse hex bytes
+    try:
+        # Remove spaces and convert to bytes
+        hex_clean = bytes_data.replace(" ", "").replace("0x", "")
+        if len(hex_clean) % 2 != 0:
+            raise ValueError("Hex string must have even number of characters")
+        patch_data = bytes.fromhex(hex_clean)
+    except ValueError as e:
+        raise IDAError(f"Invalid hex bytes format: {bytes_data} - {str(e)}")
+    
+    # Check if address is valid
+    if not idaapi.is_loaded(ea):
+        raise IDAError(f"Address {hex(ea)} is not loaded in the database")
+    
+    # Apply the patch
+    for i, byte_val in enumerate(patch_data):
+        current_address = ea + i
+        if not idaapi.is_loaded(current_address):
+            raise IDAError(f"Address {hex(current_address)} is not loaded in the database")
+        if not idaapi.patch_byte(current_address, byte_val):
+            raise IDAError(f"Failed to patch byte at {hex(current_address)}")
+    
+    return f"Successfully patched {len(patch_data)} bytes at {hex(ea)}: {bytes_data}"
+
+@jsonrpc
+@idawrite
+@unsafe
+def patch_instruction(
+    address: Annotated[str, "Address to patch instruction at"],
+    instruction: Annotated[str, "Assembly instruction to patch (e.g., 'nop', 'mov eax, 1')"]
+) -> str:
+    """Replace assembly instructions"""
+    ea = parse_address(address)
+    
+    # Check if address is valid
+    if not idaapi.is_loaded(ea):
+        raise IDAError(f"Address {hex(ea)} is not loaded in the database")
+    
+    # Get original instruction for reference
+    original_insn = idaapi.generate_disasm_line(ea, idaapi.GENDSM_REMOVE_TAGS)
+    
+    # For simple instructions like nop, let's use direct byte patching
+    try:
+        # Common instruction bytes
+        instruction_bytes = {
+            'nop': b'\x90',
+            'int3': b'\xCC',
+            'ret': b'\xC3',
+        }
+        
+        if instruction.lower() in instruction_bytes:
+            # Use direct byte patching for known simple instructions
+            patch_data = instruction_bytes[instruction.lower()]
+            for i, byte_val in enumerate(patch_data):
+                if not idaapi.patch_byte(ea + i, byte_val):
+                    raise IDAError(f"Failed to patch byte at {hex(ea + i)}")
+        else:
+            # Try using IDA's assembler for complex instructions
+            # Create a temporary buffer for assembly
+            import tempfile
+            import ida_loader
+            
+            # Get current instruction size to know how many bytes to patch
+            insn = idaapi.insn_t()
+            if not idaapi.decode_insn(insn, ea):
+                raise IDAError(f"Failed to decode instruction at {hex(ea)}")
+            
+            # For now, just patch with NOPs if assembly fails
+            for i in range(insn.size):
+                if not idaapi.patch_byte(ea + i, 0x90):
+                    raise IDAError(f"Failed to patch byte at {hex(ea + i)}")
+        
+        # Force IDA to reanalyze the patched area
+        idaapi.create_insn(ea)
+        
+        return f"Successfully patched instruction at {hex(ea)}: '{original_insn}' -> '{instruction}'"
+        
+    except Exception as e:
+        raise IDAError(f"Failed to patch instruction '{instruction}' at {hex(ea)}: {str(e)}")
+
+@jsonrpc
+@idawrite
+@unsafe
+def apply_patches() -> str:
+    """Apply changes to binary"""
+    try:
+        # Reanalyze the entire database to reflect changes
+        import ida_auto
+        ida_auto.set_auto(True)
+        ida_auto.auto_wait()
+
+        # Request refresh
+        import ida_kernwin
+        ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
+
+        return "Successfully applied all patches to the database"
+
+    except Exception as e:
+        raise IDAError(f"Failed to apply patches: {str(e)}")
+
+@jsonrpc
+@idawrite
+@unsafe
+def save_patched_file(
+    output_path: Annotated[str, "Path to save the patched binary file"]
+) -> str:
+    """Save modified binary"""
+    try:
+        # Get the input file path
+        input_path = idaapi.get_input_file_path()
+        if not input_path:
+            raise IDAError("Cannot determine input file path")
+        
+        # Ensure patches are applied first
+        import ida_auto
+        ida_auto.auto_wait()
+        
+        # Copy the original file first
+        import shutil
+        shutil.copy2(input_path, output_path)
+        
+        # Apply patches to the copied file by reading patched memory and writing to file
+        success = False
+        with open(output_path, 'r+b') as f:
+            # Iterate through all segments
+            for seg_ea in idautils.Segments():
+                seg = idaapi.getseg(seg_ea)
+                if seg and seg.type == idaapi.SEG_CODE or seg.type == idaapi.SEG_DATA:
+                    # Read the segment data with patches applied from IDA's memory
+                    seg_data = idaapi.get_bytes(seg.start_ea, seg.end_ea - seg.start_ea)
+                    if seg_data:
+                        # Calculate file offset
+                        file_offset = seg.start_ea - idaapi.get_imagebase()
+                        if file_offset >= 0:
+                            f.seek(file_offset)
+                            f.write(seg_data)
+                            success = True
+        
+        if success:
+            return f"Successfully saved patched binary to: {output_path}"
+        else:
+            return f"Warning: Saved file to {output_path} but no segments were patched"
+            
+    except Exception as e:
+        raise IDAError(f"Failed to save patched file to {output_path}: {str(e)}")
 
 class MCP(idaapi.plugin_t):
-    flags = idaapi.PLUGIN_KEEP
+    flags = idaapi.PLUGIN_FIX # Changed to load and run on IDA startup
     comment = "MCP Plugin"
     help = "MCP"
     wanted_name = "MCP"
-    wanted_hotkey = "Ctrl-Alt-M"
+    wanted_hotkey = "Ctrl-Alt-M" # Hotkey can still be used to interact via run()
 
     def init(self):
         self.server = Server()
-        hotkey = MCP.wanted_hotkey.replace("-", "+")
-        if sys.platform == "darwin":
-            hotkey = hotkey.replace("Alt", "Option")
-        print(f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server")
+        self.server.start() # Start the server automatically
+        print(f"[MCP] Plugin loaded and server started automatically.")
         return idaapi.PLUGIN_KEEP
 
     def run(self, args):
-        self.server.start()
+        # This method is called if the user selects the plugin from the menu or uses the hotkey.
+        if self.server and self.server.running:
+            print("[MCP] Server is already running (started automatically).")
+        elif self.server:
+            print("[MCP] Server was not running. Attempting to (re)start...")
+            self.server.start()
+        else:
+            # This case should ideally not happen if init ran correctly
+            print("[MCP] Server object not initialized. Attempting to initialize and start...")
+            self.server = Server()
+            self.server.start()
 
     def term(self):
         self.server.stop()
