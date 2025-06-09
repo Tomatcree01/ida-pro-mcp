@@ -1,6 +1,0 @@
-{
-  "jsonrpc": "2.0",
-  "method": "patch_bytes",
-  "params": ["0x102F2FB9", "909090"],
-  "id": 1
-}
